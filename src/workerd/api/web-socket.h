@@ -334,7 +334,7 @@ class WebSocket: public EventTarget {
   kj::Maybe<kj::Date> getAutoResponseTimestamp();
 
   kj::Promise<void> sendAutoResponse(
-      kj::String message, kj::WebSocket& ws, kj::Promise<void> writeBarrier);
+      kj::String message, kj::WeakRc<kj::WebSocket> ws, kj::Promise<void> writeBarrier);
 
   int getReadyState();
 
@@ -546,7 +546,7 @@ class WebSocketAdapter {
       kj::Maybe<kj::Date> time, kj::Promise<void> autoResponsePromise) = 0;
   virtual kj::Maybe<kj::Date> getAutoResponseTimestamp() = 0;
   virtual kj::Promise<void> sendAutoResponse(
-      kj::String message, kj::WebSocket& ws, kj::Promise<void> writeBarrier) = 0;
+      kj::String message, kj::WeakRc<kj::WebSocket> ws, kj::Promise<void> writeBarrier) = 0;
 
   // -------------------------------------------------------------------------
   // Peer tracking (the other end of a WebSocketPair).
@@ -637,7 +637,7 @@ class LegacyWebSocketAdapter final: public WebSocketAdapter {
       kj::Maybe<kj::Date> time, kj::Promise<void> autoResponsePromise) override;
   kj::Maybe<kj::Date> getAutoResponseTimestamp() override;
   kj::Promise<void> sendAutoResponse(
-      kj::String message, kj::WebSocket& ws, kj::Promise<void> writeBarrier) override;
+      kj::String message, kj::WeakRc<kj::WebSocket> ws, kj::Promise<void> writeBarrier) override;
 
   void setPeer(jsg::WeakRef<WebSocket> peer) override;
   bool peerIsAwaitingCoupling(jsg::Lock& js) override;
