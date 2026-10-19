@@ -366,15 +366,28 @@ impl<R: Resource> Default for Weak<R> {
 /// **Ownership**: The `Rc` is consumed. The JS wrapper keeps the `Wrappable`
 /// alive via `CppgcShim`. When the JS object is garbage collected and all Rust
 /// `Rc`s are dropped, the resource is destroyed.
+///
+/// # Panics
+/// Panics if the resource already has a JavaScript wrapper in another isolate. The `Rc` is
+/// leaked in that case.
 #[expect(
-    clippy::needless_pass_by_value,
-    reason = "the `Rc` is consumed: the JS wrapper takes over the reference"
+    clippy::panic,
+    reason = "using a wrapper in another isolate would mix the isolates' heaps"
 )]
 pub fn wrap<'s, R: Resource + 'static>(
     lock: &mut Lock<'s>,
     resource: Rc<R>,
 ) -> v8::Local<'s, v8::Value> {
-    resource.wrappable.to_js::<R>(lock)
+    if let Some(wrapper) = resource.wrappable.to_js::<R>(lock) {
+        return wrapper;
+    }
+    // Dropping `resource` here would release its strong reference on a wrapper of another
+    // isolate, which needs that isolate's lock. It is leaked in a box instead, which keeps
+    // pointers to the resource and its Wrappable for LeakSanitizer to follow.
+    let leaked = Box::leak(Box::new(resource));
+    // SAFETY: `leaked` is a live heap allocation.
+    unsafe { v8::ffi::ignore_leak(std::ptr::from_mut(leaked).expose_provenance()) };
+    panic!("attempt to wrap a resource in an isolate other than the one it was wrapped in");
 }
 
 /// Returns the constructor function for a resource type as a `Local<Function>`.
@@ -385,7 +398,11 @@ pub fn function_template_of<'s, R: Resource + 'static>(
     lock: &mut Lock<'s>,
 ) -> v8::Local<'s, v8::Function> {
     let isolate = lock.isolate();
-    let constructor = lock.realm().resources.get_constructor::<R>(isolate);
+    let isolate_id = lock.isolate_id();
+    let constructor = lock
+        .realm()
+        .resources
+        .get_constructor::<R>(isolate, isolate_id);
     // SAFETY: `isolate` is valid and locked (Lock invariant). `constructor` is a valid
     // Global<FunctionTemplate> cached in the Realm. Inlined from `as_local_function` to
     // avoid re-borrowing `self` while `constructor` holds an immutable borrow through `realm()`.
@@ -482,27 +499,26 @@ pub struct Resources {
 
 impl Resources {
     /// Gets or creates the cached `FunctionTemplate` for a resource type.
-    pub fn get_constructor<R: Resource + 'static>(
+    pub(crate) fn get_constructor<R: Resource + 'static>(
         &mut self,
         isolate: v8::IsolatePtr,
+        isolate_id: crate::scope::IsolateId,
     ) -> &v8::Global<v8::FunctionTemplate> {
         self.templates
             .entry(TypeId::of::<R>())
-            .or_insert_with(|| Self::create_resource_constructor::<R>(isolate))
+            .or_insert_with(|| Self::create_resource_constructor::<R>(isolate, isolate_id))
     }
 
     /// Creates a new V8 `FunctionTemplate` for resource type `R` via the C++ FFI.
     fn create_resource_constructor<R: Resource>(
         isolate: v8::IsolatePtr,
+        isolate_id: crate::scope::IsolateId,
     ) -> v8::Global<v8::FunctionTemplate> {
-        // SAFETY: Caller guarantees the isolate is valid and locked; the template handle it
-        // returns is valid.
-        unsafe {
-            v8::Global::from_ffi(v8::ffi::create_resource_template(
-                isolate.as_ffi(),
-                &get_resource_descriptor::<R>(),
-            ))
-        }
+        // SAFETY: Caller guarantees the isolate is valid and locked.
+        let handle = unsafe {
+            v8::ffi::create_resource_template(isolate.as_ffi(), &get_resource_descriptor::<R>())
+        };
+        v8::Global::from_ffi_in(handle, isolate_id)
     }
 
     /// Drains every cached resource-template handle, transferring ownership of each

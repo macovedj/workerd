@@ -591,6 +591,10 @@ pub mod ffi {
         pub unsafe fn isolate_terminate_execution(isolate: *mut Isolate);
         pub unsafe fn isolate_is_locked(isolate: *mut Isolate) -> bool;
         pub unsafe fn isolate_in_context(isolate: *mut Isolate) -> bool;
+
+        /// Tells LeakSanitizer, if enabled, that the heap allocation at `ptr` is leaked on
+        /// purpose, along with everything reachable from it.
+        pub unsafe fn ignore_leak(ptr: usize);
     }
 
     /// Fat pointer to a `dyn GarbageCollected` trait object plus its TypeId.
@@ -665,7 +669,7 @@ pub mod ffi {
             isolate: *mut Isolate,
             wrappable: KjRc<Wrappable>,
             constructor: &Global, /* v8::Global<FunctionTemplate> */
-        ) -> Local /* v8::Local<Value> */;
+        ) -> MaybeLocal /* v8::Local<Value>, empty if wrapped in another isolate */;
 
         pub unsafe fn wrappable_attach_wrapper(
             wrappable: KjRc<Wrappable>,
@@ -1630,10 +1634,10 @@ impl<'s> Local<'s, Array> {
         // SAFETY: lock guarantees the isolate is locked; handle is valid in scope 's.
         let globals =
             unsafe { ffi::local_array_iterate(lock.isolate().as_ffi(), self.into_ffi()) }?;
+        let isolate = lock.isolate_id();
         Ok(globals
             .into_iter()
-            // SAFETY: each Global handle was created by the C++ side and is valid.
-            .map(|g| unsafe { Global::from_ffi(g) })
+            .map(|g| Global::from_ffi_in(g, isolate))
             .collect())
     }
 }
@@ -3019,6 +3023,8 @@ pub struct Global<T> {
     /// This is sound because GC tracing is always single-threaded within a V8
     /// isolate and `trace` is never re-entrant on the same object.
     traced: UnsafeCell<ffi::TracedReference>,
+    /// The isolate the handle was created in; every use checks it.
+    isolate: crate::scope::IsolateId,
     /// `*const T` makes `Global` neither `Send` nor `Sync`: dropping it resets the V8
     /// handle, which must happen on the isolate's thread.
     _marker: PhantomData<*const T>,
@@ -3028,22 +3034,39 @@ pub struct Global<T> {
 impl<T> Global<T> {
     /// Creates a persistent handle to `local`.
     pub fn new(lock: &mut Lock<'_>, local: Local<'_, T>) -> Self {
-        // SAFETY: isolate is valid and locked (guaranteed by Lock); the handle is valid.
+        // SAFETY: isolate is valid and locked (guaranteed by Lock); the handle is valid, and
+        // belongs to the lock's isolate because all open scopes do.
         let handle = unsafe { ffi::local_to_global(lock.isolate().as_ffi(), local.into_ffi()) };
-        // SAFETY: `local_to_global` returns a valid persistent handle.
-        unsafe { Self::from_ffi(handle) }
+        Self::from_ffi_in(handle, lock.isolate_id())
     }
 
     /// Creates a `Global` from an FFI handle.
     ///
     /// # Safety
-    /// The caller must ensure that `handle` points to a valid V8 persistent handle.
-    pub unsafe fn from_ffi(handle: ffi::Global) -> Self {
+    /// The caller must ensure that `handle` points to a valid V8 persistent handle of the
+    /// lock's isolate.
+    pub unsafe fn from_ffi(lock: &mut Lock<'_>, handle: ffi::Global) -> Self {
+        Self::from_ffi_in(handle, lock.isolate_id())
+    }
+
+    pub(crate) fn from_ffi_in(handle: ffi::Global, isolate: crate::scope::IsolateId) -> Self {
         Self {
             handle,
             traced: UnsafeCell::new(ffi::TracedReference { ptr: 0 }),
+            isolate,
             _marker: PhantomData,
         }
+    }
+
+    /// Checks that `lock` belongs to the isolate this handle was created in.
+    ///
+    /// # Panics
+    /// Panics if it does not.
+    fn assert_in_isolate_of(&self, lock: &mut Lock<'_>) {
+        assert!(
+            self.isolate == lock.isolate_id(),
+            "attempt to use a Global in an isolate other than the one it was created in"
+        );
     }
 
     /// Returns a reference to the underlying FFI handle.
@@ -3064,6 +3087,7 @@ impl<T> Global<T> {
 
     /// Materializes this handle as a `Local` in the scope of `lock`.
     pub fn as_local<'s>(&self, lock: &mut Lock<'s>) -> Local<'s, T> {
+        self.assert_in_isolate_of(lock);
         // SAFETY: isolate is valid and locked (guaranteed by Lock); global handle is valid.
         unsafe {
             Local::from_ffi(
@@ -3099,6 +3123,7 @@ impl Global<FunctionTemplate> {
     /// used to access static methods, analogous to a JavaScript class reference
     /// (e.g., `URL`, `TextEncoder`).
     pub fn as_local_function<'s>(&self, lock: &mut Lock<'s>) -> Local<'s, Function> {
+        self.assert_in_isolate_of(lock);
         // SAFETY: `lock` guarantees the isolate is locked and a HandleScope is active.
         // `self.handle` is a valid `Global<FunctionTemplate>` created by `create_resource_template`.
         // The returned `Local` is tied to the lock's HandleScope via the `'s` lifetime.
@@ -3165,10 +3190,10 @@ impl<T> Global<T> {
     /// next GC cycle.
     #[must_use]
     pub fn clone(&self, lock: &mut Lock) -> Self {
+        self.assert_in_isolate_of(lock);
         // SAFETY: isolate is valid and locked (guaranteed by Lock); global handle is valid.
         let handle = unsafe { ffi::global_clone(lock.isolate().as_ffi(), &self.handle) };
-        // SAFETY: `global_clone` returns a valid persistent handle.
-        unsafe { Self::from_ffi(handle) }
+        Self::from_ffi_in(handle, self.isolate)
     }
 }
 
@@ -3732,21 +3757,26 @@ impl WrappableRc {
 
     /// Wraps this Wrappable as a JavaScript object of resource type `R`, using (and on first
     /// use creating) `R`'s cached constructor template.
-    pub(crate) fn to_js<'s, R: Resource>(&self, lock: &mut Lock<'s>) -> Local<'s, Value> {
+    ///
+    /// Returns `None` if the Wrappable already has a JavaScript wrapper in another isolate.
+    pub(crate) fn to_js<'s, R: Resource>(&self, lock: &mut Lock<'s>) -> Option<Local<'s, Value>> {
         let isolate = lock.isolate();
-        let constructor = lock.realm().resources.get_constructor::<R>(isolate);
-        // SAFETY: isolate is valid and locked; constructor global handle is valid. The wrapper
-        // is created in (or read into) the scope of `lock`.
-        unsafe {
-            Local::from_ffi(
-                isolate,
-                ffi::wrap_resource(
-                    isolate.as_ffi(),
-                    self.handle.clone(),
-                    constructor.as_ffi_ref(),
-                ),
+        let isolate_id = lock.isolate_id();
+        let constructor = lock
+            .realm()
+            .resources
+            .get_constructor::<R>(isolate, isolate_id);
+        // SAFETY: isolate is valid and locked; constructor global handle is valid.
+        let handle = unsafe {
+            ffi::wrap_resource(
+                isolate.as_ffi(),
+                self.handle.clone(),
+                constructor.as_ffi_ref(),
             )
-        }
+        };
+        // SAFETY: the wrapper is created in (or read into) the scope of `lock`.
+        let handle: MaybeLocal<'s, Value> = unsafe { MaybeLocal::from_ffi(handle) };
+        handle.into_option(lock)
     }
 
     /// Attaches this Wrappable to the `this` object in a V8 constructor callback.

@@ -124,6 +124,12 @@ scope. There is no public constructor; locks come from:
   scope already open; the caller vouches for the isolate's state, hence `unsafe`,
 - `jsg_test::Harness::run_in_context`.
 
+All scopes open on a thread at the same time must belong to one isolate: opening a scope of
+another isolate while one is open panics, so a handle is never used with another isolate's
+lock. `jsg::allow_scopes_of_another_isolate` (`unsafe`) lifts the rule for code that must open
+scopes of a second isolate. Handles that outlive scopes remember their isolate and panic when
+used in another: `Global<T>`, and the JS wrapper of a `jsg::Rc<T>`.
+
 ### `Local<'s, T>`
 
 A `Copy` handle to a V8 value, valid for the scope `'s` it was created in. Every API that

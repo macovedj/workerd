@@ -30,6 +30,7 @@ pub use scope::RawFunctionCallback;
 pub use scope::RawGetterCallback;
 pub use scope::RawSetterCallback;
 pub use scope::UnitType;
+pub use scope::allow_scopes_of_another_isolate;
 pub use scope::function_callback;
 pub use scope::getter_callback;
 pub use scope::setter_callback;
@@ -955,6 +956,7 @@ pub trait Struct: Type {}
 /// `CppgcShim` destruction triggers cleanup of the underlying `Wrappable`.
 pub struct Realm {
     isolate: v8::IsolatePtr,
+    id: scope::IsolateId,
     pub(crate) resources: resource::Resources,
     /// Parsed `CompatibilityFlags` capnp message, initialized at construction.
     feature_flags: FeatureFlags,
@@ -965,6 +967,7 @@ impl Realm {
     pub fn new(isolate: v8::IsolatePtr, feature_flags: FeatureFlags) -> Self {
         Self {
             isolate,
+            id: scope::IsolateId::next(),
             resources: resource::Resources::default(),
             feature_flags,
         }
@@ -972,6 +975,10 @@ impl Realm {
 
     pub fn isolate(&self) -> v8::IsolatePtr {
         self.isolate
+    }
+
+    pub(crate) fn id(&self) -> scope::IsolateId {
+        self.id
     }
 }
 
@@ -1017,6 +1024,9 @@ fn realm_take_resource_templates(realm: &mut Realm) -> Vec<v8::ffi::Global> {
 /// mirrors what C++ `KJ_ASSERT` effectively does inside an isolate context and
 /// closes the window where a panicked resource with partially-mutated `jsg::Rc`
 /// fields could be observed by a subsequent GC trace before isolate teardown.
+///
+/// Opening the scope is part of what is caught, so a callback entered while a scope of
+/// another isolate is open on the thread throws too, instead of unwinding into V8.
 #[expect(
     unsafe_code,
     reason = "throws without a lock if the scope did not open"

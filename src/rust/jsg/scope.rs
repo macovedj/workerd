@@ -20,10 +20,24 @@
 //! let obj = lock.new_object();
 //! ```
 //!
-
+//! ### Isolates
+//!
+//! Lifetimes tie a handle to its scope, not to that scope's isolate. To keep handles of one
+//! isolate out of another, all scopes open on a thread at the same time must belong to one
+//! isolate: opening a scope of another isolate while one is open panics. A handle cannot
+//! outlive its scope, so every live handle belongs to the isolate of any lock it can be
+//! used with. Code that needs scopes of two isolates open at once can open the second
+//! isolate's scopes inside the `unsafe` [`allow_scopes_of_another_isolate`].
+//!
+//! Handles that outlive scopes remember their isolate and panic when used in another:
+//! [`v8::Global`](crate::v8::Global) and the JavaScript wrapper of an [`Rc`](crate::Rc).
+//!
 use std::marker::PhantomData;
 use std::marker::PhantomPinned;
+use std::num::NonZeroU64;
 use std::pin::Pin;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use crate::v8;
 
@@ -52,6 +66,115 @@ impl Lock<'_> {
     pub fn isolate(&self) -> v8::IsolatePtr {
         self.isolate
     }
+
+    /// Returns the identity of this lock's isolate.
+    pub(crate) fn isolate_id(&mut self) -> IsolateId {
+        self.realm().id()
+    }
+}
+
+/// Identifies an isolate. Unlike its address, an `IsolateId` is never reused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IsolateId(NonZeroU64);
+
+impl IsolateId {
+    pub fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self(NonZeroU64::MIN.saturating_add(NEXT.fetch_add(1, Ordering::Relaxed)))
+    }
+}
+
+/// Tracks which isolate owns the scopes open on this thread.
+pub mod scope_owner {
+    use std::cell::Cell;
+    use std::ptr;
+
+    use crate::v8;
+
+    #[derive(Clone, Copy)]
+    struct State {
+        isolate: *mut v8::ffi::Isolate,
+        depth: usize,
+    }
+
+    const NONE: State = State {
+        isolate: ptr::null_mut(),
+        depth: 0,
+    };
+
+    thread_local! {
+        static STATE: Cell<State> = const { Cell::new(NONE) };
+    }
+
+    /// Records that a scope of `isolate` was opened.
+    ///
+    /// # Panics
+    /// Panics if a scope of another isolate is open on this thread.
+    pub fn enter(isolate: v8::IsolatePtr) {
+        STATE.with(|state| {
+            let mut s = state.get();
+            if s.depth == 0 {
+                s = State {
+                    isolate: isolate.as_ffi(),
+                    ..NONE
+                };
+            } else {
+                assert!(
+                    s.isolate == isolate.as_ffi(),
+                    "attempt to open a scope of an isolate while a scope of another isolate is \
+                     open on this thread"
+                );
+            }
+            s.depth += 1;
+            state.set(s);
+        });
+    }
+
+    /// Records that a scope opened with [`enter`] was closed.
+    pub fn exit() {
+        STATE.with(|state| {
+            let mut s = state.get();
+            debug_assert!(s.depth > 0, "scope_owner::exit() without enter()");
+            s.depth -= 1;
+            state.set(s);
+        });
+    }
+
+    /// Runs `f` as if no scope were open on this thread, and restores the open scopes after.
+    pub fn suspend<R>(f: impl FnOnce() -> R) -> R {
+        struct Restore(State);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                STATE.with(|state| {
+                    debug_assert_eq!(
+                        state.get().depth,
+                        0,
+                        "a scope opened inside allow_scopes_of_another_isolate() is still open"
+                    );
+                    state.set(self.0);
+                });
+            }
+        }
+        let _restore = Restore(STATE.with(|state| state.replace(NONE)));
+        f()
+    }
+}
+
+/// Runs `f` with the scopes open on this thread set aside, so `f` can open scopes of
+/// another isolate. They count as open again once `f` returns.
+///
+/// # Safety
+///
+/// While `f` runs, handles of the isolate whose scopes were set aside must not be used with
+/// any other isolate, and handles that `f` creates must not be used once it returns. `f`
+/// must close every scope it opens, and must not close any scope that was open when it was
+/// called.
+#[expect(
+    unsafe_code,
+    reason = "lifts the one-isolate-per-thread rule that keeps handles in their isolate"
+)]
+pub unsafe fn allow_scopes_of_another_isolate<R>(f: impl FnOnce() -> R) -> R {
+    scope_owner::suspend(f)
 }
 
 /// What a [`CallbackScope`] can be created from.
@@ -120,8 +243,11 @@ impl CallbackScopeParam for *mut v8::ffi::PropertySetterCallbackInfo {
 
 /// Storage of a lock for a `HandleScope` that C++ or V8 opened before calling into Rust.
 /// Use [`callback_scope!`] to open one.
+///
+/// While it is open, it counts as a scope of its isolate for the one-isolate-per-thread rule.
 pub struct CallbackScope {
     lock: Lock<'static>,
+    open: bool,
     _pinned: PhantomPinned,
 }
 
@@ -134,19 +260,28 @@ impl CallbackScope {
     /// `PropertySetterCallbackInfo` V8 passed to the running callback, or a valid isolate
     /// pointer. The isolate must be locked by this thread with a context entered, and its
     /// innermost `v8::HandleScope` must stay open and innermost until the storage is dropped.
-    /// No other `Lock` for that `HandleScope` may be used while the storage lives.
+    /// No other `Lock` for that `HandleScope` may be used while the storage lives. The
+    /// storage must be dropped, not leaked, or its isolate keeps owning the thread.
     pub unsafe fn new(param: impl CallbackScopeParam) -> Self {
         Self {
             // SAFETY: forwarded from the caller.
             lock: Lock::new(unsafe { param.into_isolate() }),
+            open: false,
             _pinned: PhantomPinned,
         }
     }
 
     /// Opens the scope and returns its lock.
+    ///
+    /// # Panics
+    /// Panics if a scope of another isolate is open on this thread.
     pub fn open<'s>(self: Pin<&'s mut Self>) -> &'s mut Lock<'s> {
         // SAFETY: nothing is moved out of the storage.
         let this = unsafe { self.get_unchecked_mut() };
+        if !this.open {
+            scope_owner::enter(this.lock.isolate);
+            this.open = true;
+        }
         // SAFETY: `Lock<'s>` differs from `Lock<'static>` only in its brand; `new`'s caller
         // keeps the scope open and innermost while the storage lives.
         unsafe { &mut *(&raw mut this.lock).cast::<Lock<'s>>() }
@@ -154,6 +289,14 @@ impl CallbackScope {
 
     pub(crate) const fn isolate(&self) -> v8::IsolatePtr {
         self.lock.isolate
+    }
+}
+
+impl Drop for CallbackScope {
+    fn drop(&mut self) {
+        if self.open {
+            scope_owner::exit();
+        }
     }
 }
 
@@ -186,7 +329,8 @@ pub type RawFunctionCallback = unsafe extern "C" fn(*mut v8::ffi::FunctionCallba
 /// Turns `f` into a V8 function callback.
 ///
 /// The callback opens a [`CallbackScope`] and calls `f` with its lock and the callback's
-/// arguments. A panic in `f` throws an internal error to JavaScript and terminates execution.
+/// arguments. A panic in `f`, or a scope of another isolate
+/// being open on the thread, throws an internal error to JavaScript and terminates execution.
 ///
 /// `f` must capture nothing, which a compile-time assertion checks.
 pub fn function_callback<F>(f: F) -> RawFunctionCallback
