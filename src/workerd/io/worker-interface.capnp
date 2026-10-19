@@ -923,15 +923,24 @@ interface DatagramStream $Cxx.allowCancellation {
   # Signals that no more datagrams will be sent and reports errors from previous send() calls.
 }
 
+interface TraceCompletion {
+  # Has no methods. A trace sender passes one to EventDispatcher.sendTraces() and learns that the
+  # trace handler has finished, been canceled, or been abandoned when the capability is released.
+}
+
 interface EventDispatcher @0xf20697475ec1752d {
   # Interface used to deliver events to a Worker's global event handlers.
 
   getHttpService @0 () -> (http :HttpService) $Cxx.allowCancellation;
   # Gets the HTTP interface to this worker (to trigger FetchEvents).
 
-  sendTraces @1 (traces :List(Trace)) -> (result :SendTracesRun) $Cxx.allowCancellation;
+  sendTraces @1 (traces :List(Trace), completion :TraceCompletion)
+      -> (result :SendTracesRun) $Cxx.allowCancellation;
   # Deliver a trace event to a trace worker. This always completes immediately; the trace handler
   # runs as a "waitUntil" task.
+  #
+  # If `completion` is set, the callee holds it until the trace handler's request has drained, so
+  # the caller can tell when the handler's work is done. See TraceCompletion.
 
   prewarm @2 (url :Text) $Cxx.allowCancellation;
 
