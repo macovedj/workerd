@@ -26,32 +26,17 @@ mod ffi {
     }
 }
 
-#[expect(
-    unsafe_code,
-    reason = "opens a scope for the isolate pointer C++ hands to each module callback"
-)]
 pub fn register_nodejs_modules(mut registry: Pin<&mut ffi::ModuleRegistry>) {
     jsg::modules::add_builtin(
         registry.as_mut(),
         "node-internal:dns",
-        |isolate| {
-            // SAFETY: called from the C++ module registry with the isolate locked, a context
-            // entered and a scope open.
-            jsg::callback_scope!(unsafe let lock, isolate);
-            // SAFETY: the registry converts the handle back before its scope closes.
-            unsafe { DnsUtil::new().to_js(lock).into_ffi() }
-        },
+        |lock| DnsUtil::new().to_js(lock),
         jsg::modules::ModuleType::Internal,
     );
     jsg::modules::add_builtin(
         registry,
         "node-internal:url",
-        |isolate| {
-            // SAFETY: as above.
-            jsg::callback_scope!(unsafe let lock, isolate);
-            // SAFETY: as above.
-            unsafe { UrlUtil::new().to_js(lock).into_ffi() }
-        },
+        |lock| UrlUtil::new().to_js(lock),
         jsg::modules::ModuleType::Internal,
     );
 }

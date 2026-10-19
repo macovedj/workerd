@@ -120,6 +120,8 @@ scope. There is no public constructor; locks come from:
   with `jsg::function_callback`, which turns a closure that captures nothing into a V8
   function callback without any `unsafe`, as `rusty_v8` does; `#[jsg_property(instance)]`
   accessors likewise with `jsg::getter_callback` / `jsg::setter_callback`,
+- `jsg::modules::add_builtin`, whose callback is a closure that captures nothing, of type
+  `for<'s> Fn(&mut Lock<'s>) -> Local<'s, Value>`,
 - `jsg::callback_scope!(unsafe let lock, isolate)` for other Rust code that C++ calls with a
   scope already open; the caller vouches for the isolate's state, hence `unsafe`,
 - `jsg_test::Harness::run_in_context`.
