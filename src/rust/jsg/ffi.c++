@@ -1205,4 +1205,8 @@ bool isolate_is_locked(Isolate* isolate) {
   return v8::Locker::IsLocked(isolate);
 }
 
+bool isolate_in_context(Isolate* isolate) {
+  return isolate->InContext();
+}
+
 }  // namespace workerd::rust::jsg

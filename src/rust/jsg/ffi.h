@@ -361,5 +361,6 @@ void isolate_throw_error(Isolate* isolate, ::rust::Str message);
 void isolate_throw_internal_error(Isolate* isolate, ::rust::Str internalMessage);
 void isolate_terminate_execution(Isolate* isolate);
 bool isolate_is_locked(Isolate* isolate);
+bool isolate_in_context(Isolate* isolate);
 
 }  // namespace workerd::rust::jsg

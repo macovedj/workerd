@@ -125,7 +125,7 @@ impl<R: Resource> Rc<R> {
     /// the `this` object from the `FunctionTemplate`'s `InstanceTemplate`;
     /// this method attaches the `Wrappable` to it so that instance methods
     /// can resolve the resource via `resolve_resource`.
-    pub fn attach_to_this(&self, info: &mut v8::FunctionCallbackInfo) {
+    pub fn attach_to_this(&self, info: &mut v8::FunctionCallbackInfo<'_>) {
         self.wrappable.attach_to_this(info);
     }
 
@@ -164,31 +164,31 @@ impl<R: Resource> Drop for Rc<R> {
     }
 }
 
-impl<R: Resource + 'static> ToJS for Rc<R> {
-    fn to_js<'a, 'b>(self, lock: &'a mut Lock) -> v8::Local<'b, v8::Value>
-    where
-        'b: 'a,
-    {
+impl<'s, R: Resource + 'static> ToJS<'s> for Rc<R> {
+    fn to_js(self, lock: &mut Lock<'s>) -> v8::Local<'s, v8::Value> {
         wrap(lock, self)
     }
 }
 
-impl<R: Resource + 'static> FromJS for Rc<R> {
+impl<'s, R: Resource + 'static> FromJS<'s> for Rc<R> {
     type ResultType = Self;
 
     fn type_name() -> String {
         R::class_name().to_owned()
     }
 
-    fn from_js(lock: &mut Lock, value: v8::Local<v8::Value>) -> Result<Self, Error> {
+    fn from_js(lock: &mut Lock<'s>, value: v8::Local<'s, v8::Value>) -> Result<Self, Error> {
         let type_name = value.type_of();
         Self::try_from_js(lock, value)?.ok_or_else(|| {
             Error::new_type_error(format!("expected {}, got {type_name}", R::class_name()))
         })
     }
 
-    fn try_from_js(lock: &mut Lock, value: v8::Local<v8::Value>) -> Result<Option<Self>, Error> {
-        let Some(mut wrappable) = v8::WrappableRc::from_js(lock.isolate(), value) else {
+    fn try_from_js(
+        lock: &mut Lock<'s>,
+        value: v8::Local<'s, v8::Value>,
+    ) -> Result<Option<Self>, Error> {
+        let Some(mut wrappable) = v8::WrappableRc::from_js(lock, value) else {
             return Ok(None);
         };
         let Some(resource_ptr) = wrappable.resolve_resource::<R>() else {
@@ -370,23 +370,20 @@ impl<R: Resource> Default for Weak<R> {
     clippy::needless_pass_by_value,
     reason = "the `Rc` is consumed: the JS wrapper takes over the reference"
 )]
-pub fn wrap<'a, R: Resource + 'static>(
-    lock: &mut Lock,
+pub fn wrap<'s, R: Resource + 'static>(
+    lock: &mut Lock<'s>,
     resource: Rc<R>,
-) -> v8::Local<'a, v8::Value> {
-    let isolate = lock.isolate();
-    let constructor = lock.realm().resources.get_constructor::<R>(isolate);
-
-    resource.wrappable.to_js(isolate, constructor)
+) -> v8::Local<'s, v8::Value> {
+    resource.wrappable.to_js::<R>(lock)
 }
 
 /// Returns the constructor function for a resource type as a `Local<Function>`.
 ///
 /// Lazily creates and caches the `FunctionTemplate` in the `Realm` on first call.
 /// The returned function can be exposed as a global (e.g., `ctx.set_global("MyClass", func)`).
-pub fn function_template_of<'a, R: Resource + 'static>(
-    lock: &mut Lock,
-) -> v8::Local<'a, v8::Function> {
+pub fn function_template_of<'s, R: Resource + 'static>(
+    lock: &mut Lock<'s>,
+) -> v8::Local<'s, v8::Function> {
     let isolate = lock.isolate();
     let constructor = lock.realm().resources.get_constructor::<R>(isolate);
     // SAFETY: `isolate` is valid and locked (Lock invariant). `constructor` is a valid
@@ -498,10 +495,13 @@ impl Resources {
     fn create_resource_constructor<R: Resource>(
         isolate: v8::IsolatePtr,
     ) -> v8::Global<v8::FunctionTemplate> {
-        // SAFETY: Caller guarantees the isolate is valid and locked.
+        // SAFETY: Caller guarantees the isolate is valid and locked; the template handle it
+        // returns is valid.
         unsafe {
-            v8::ffi::create_resource_template(isolate.as_ffi(), &get_resource_descriptor::<R>())
-                .into()
+            v8::Global::from_ffi(v8::ffi::create_resource_template(
+                isolate.as_ffi(),
+                &get_resource_descriptor::<R>(),
+            ))
         }
     }
 

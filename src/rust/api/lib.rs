@@ -28,28 +28,29 @@ mod ffi {
 
 #[expect(
     unsafe_code,
-    reason = "builds a `Lock` from the isolate pointer C++ hands to each module callback"
+    reason = "opens a scope for the isolate pointer C++ hands to each module callback"
 )]
 pub fn register_nodejs_modules(mut registry: Pin<&mut ffi::ModuleRegistry>) {
     jsg::modules::add_builtin(
         registry.as_mut(),
         "node-internal:dns",
-        // SAFETY: isolate is valid and locked — called from C++ module registration.
-        |isolate| unsafe {
-            let mut lock = jsg::Lock::from_isolate_ptr(isolate);
-            let dns_util = DnsUtil::new();
-            dns_util.to_js(&mut lock).into_ffi()
+        |isolate| {
+            // SAFETY: called from the C++ module registry with the isolate locked, a context
+            // entered and a scope open.
+            jsg::callback_scope!(unsafe let lock, isolate);
+            // SAFETY: the registry converts the handle back before its scope closes.
+            unsafe { DnsUtil::new().to_js(lock).into_ffi() }
         },
         jsg::modules::ModuleType::Internal,
     );
     jsg::modules::add_builtin(
         registry,
         "node-internal:url",
-        // SAFETY: isolate is valid and locked — called from C++ module registration.
-        |isolate| unsafe {
-            let mut lock = jsg::Lock::from_isolate_ptr(isolate);
-            let url_util = UrlUtil::new();
-            url_util.to_js(&mut lock).into_ffi()
+        |isolate| {
+            // SAFETY: as above.
+            jsg::callback_scope!(unsafe let lock, isolate);
+            // SAFETY: as above.
+            unsafe { UrlUtil::new().to_js(lock).into_ffi() }
         },
         jsg::modules::ModuleType::Internal,
     );
