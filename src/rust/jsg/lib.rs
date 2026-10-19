@@ -1011,13 +1011,14 @@ fn realm_take_resource_templates(realm: &mut Realm) -> Vec<v8::ffi::Global> {
 }
 
 /// Opens `scope` and runs `f` with its lock, catching any panic and converting it to a JS
-/// internal error.
+/// internal error. Returns what `f` returns, or `None` if it panicked.
 ///
-/// [`function_callback`] calls this so that a Rust panic is handled the same way as
-/// `KJ_ASSERT(false)` in C++ JSG handlers: the internal panic message is logged via
-/// `KJ_LOG(ERROR)` (reaching Sentry) and the JS caller receives a generic
-/// `"Error: internal error; reference = <id>"` exception with a unique
-/// reference ID, keeping the internal message out of JS-visible output.
+/// Rust code that C++ or V8 calls with a scope open runs through this, so that a Rust panic
+/// is handled the same way as `KJ_ASSERT(false)` in C++ JSG handlers: the internal panic
+/// message is logged via `KJ_LOG(ERROR)` (reaching Sentry) and the JS caller receives a
+/// generic `"Error: internal error; reference = <id>"` exception with a unique reference ID,
+/// keeping the internal message out of JS-visible output. On `None`, that exception is
+/// pending, and the C++ caller should propagate it as `jsg::JsExceptionThrown`.
 ///
 /// After logging the error, `terminate_execution()` is called so that V8 raises
 /// an uncatchable termination exception and unwinds all JS call frames. This
@@ -1025,38 +1026,39 @@ fn realm_take_resource_templates(realm: &mut Realm) -> Vec<v8::ffi::Global> {
 /// closes the window where a panicked resource with partially-mutated `jsg::Rc`
 /// fields could be observed by a subsequent GC trace before isolate teardown.
 ///
-/// Opening the scope is part of what is caught, so a callback entered while a scope of
-/// another isolate is open on the thread throws too, instead of unwinding into V8.
+/// Opening the scope is part of what is caught, so Rust code entered while a scope of
+/// another isolate is open on the thread throws too, instead of unwinding into C++ or V8.
+/// `f`'s result cannot hold handles of the scope; convert them to their FFI form inside `f`.
 #[expect(
     unsafe_code,
     reason = "throws without a lock if the scope did not open"
 )]
-pub(crate) fn catch_panic<F>(scope: Pin<&mut CallbackScope>, f: F)
+pub fn catch_panic<F, R>(scope: Pin<&mut CallbackScope>, f: F) -> Option<R>
 where
-    F: for<'s> FnOnce(&'s mut Lock<'s>),
+    F: for<'s> FnOnce(&'s mut Lock<'s>) -> R,
 {
     let isolate = scope.isolate();
-    // SAFETY: `f` is called from an `extern "C"` V8 callback made by
-    // `function_callback`. Raw pointers captured by `f` are valid for the entire
-    // duration of the callback (V8 guarantees this), and V8 is
-    // single-threaded, so there is no aliasing hazard on unwind.
-    // `AssertUnwindSafe` is therefore correct here.
-    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(scope.open())))
-    {
-        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-            *s
-        } else if let Some(s) = payload.downcast_ref::<String>() {
-            s.as_str()
-        } else {
-            "<non-string panic payload>"
-        };
-        // The scope may not have opened, so there may be no lock to throw with.
-        // SAFETY: the caller of `CallbackScope::new` keeps the isolate locked, with a context
-        // entered and a `HandleScope` open, while `scope` lives. The unwind closed the scopes
-        // opened inside `f`.
-        unsafe {
-            v8::ffi::isolate_throw_internal_error(isolate.as_ffi(), msg);
-            v8::ffi::isolate_terminate_execution(isolate.as_ffi());
+    // V8 is single-threaded and the panic terminates execution, so no JavaScript observes
+    // state that `f` left half-updated.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(scope.open()))) {
+        Ok(result) => Some(result),
+        Err(payload) => {
+            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                *s
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.as_str()
+            } else {
+                "<non-string panic payload>"
+            };
+            // The scope may not have opened, so there may be no lock to throw with.
+            // SAFETY: the caller of `CallbackScope::new` keeps the isolate locked, with a
+            // context entered and a `HandleScope` open, while `scope` lives. The unwind closed
+            // the scopes opened inside `f`.
+            unsafe {
+                v8::ffi::isolate_throw_internal_error(isolate.as_ffi(), msg);
+                v8::ffi::isolate_terminate_execution(isolate.as_ffi());
+            }
+            None
         }
     }
 }

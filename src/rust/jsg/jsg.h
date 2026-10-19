@@ -18,6 +18,15 @@
 
 namespace workerd::rust::jsg {
 
+// Calls a Rust module callback. An empty result means it panicked and threw.
+inline v8::Local<v8::Value> callModuleCallback(ModuleCallback callback, ::workerd::jsg::Lock& js) {
+  v8::Local<v8::Value> value;
+  if (!maybe_local_from_ffi<v8::Value>(callback(js.v8Isolate)).ToLocal(&value)) {
+    throw ::workerd::jsg::JsExceptionThrown();
+  }
+  return value;
+}
+
 // Adapter for registering Rust-implemented modules into the OLD module registry
 // (jsg::ModuleRegistryImpl). Translates Rust ModuleCallback into ModuleInfo.
 template <typename Registry>
@@ -47,8 +56,7 @@ struct RustModuleRegistry: public ::workerd::rust::jsg::ModuleRegistry {
             ::workerd::jsg::Lock& js, ::workerd::jsg::ModuleRegistry::ResolveMethod,
             kj::Maybe<const kj::Path&>&) mutable
         -> kj::Maybe<::workerd::jsg::ModuleRegistry::ModuleInfo> {
-      auto localValue = callback(js.v8Isolate);
-      auto value = local_from_ffi<v8::Value>(kj::mv(localValue));
+      auto value = callModuleCallback(callback, js);
       KJ_DASSERT(value->IsObject());
 
       using ModuleInfo = ::workerd::jsg::ModuleRegistry::ModuleInfo;
@@ -103,8 +111,7 @@ struct RustBuiltinModuleAdapter: public ::workerd::rust::jsg::ModuleRegistry {
           [callback = kj::mv(moduleCallback)](::workerd::jsg::Lock& js, const ::workerd::jsg::Url&,
               const ::workerd::jsg::modules::Module::ModuleNamespace& ns,
               const ::workerd::jsg::CompilationObserver&) mutable {
-        auto localValue = callback(js.v8Isolate);
-        auto value = local_from_ffi<v8::Value>(kj::mv(localValue));
+        auto value = callModuleCallback(callback, js);
         KJ_DASSERT(value->IsObject());
         ns.setDefault(js, ::workerd::jsg::JsValue(value));
         return true;

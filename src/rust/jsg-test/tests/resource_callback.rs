@@ -485,6 +485,51 @@ fn panic_in_rust_backed_api_errors_request_and_terminates_isolate() {
     });
 }
 
+/// A resource whose method runs closures in a nested `CallbackScope` through
+/// `jsg::catch_panic`, as a Rust entry point called from C++ does.
+#[jsg_resource]
+struct CatchPanicResource;
+
+#[jsg_resource]
+impl CatchPanicResource {
+    #[jsg_method]
+    pub fn catch_nested_panic(&self, lock: &mut jsg::Lock) {
+        let isolate = lock.isolate().as_ffi();
+
+        // SAFETY: the callback's scope is open and innermost while `scope` lives, and `lock`
+        // is not used meanwhile.
+        let scope = std::pin::pin!(unsafe { jsg::CallbackScope::new(isolate) });
+        assert_eq!(jsg::catch_panic(scope, |_| 7), Some(7));
+
+        // SAFETY: as above.
+        let scope = std::pin::pin!(unsafe { jsg::CallbackScope::new(isolate) });
+        let result: Option<()> = jsg::catch_panic(scope, |_| panic!("intentional nested panic"));
+        assert_eq!(result, None);
+    }
+}
+
+/// A panic caught by `jsg::catch_panic` leaves an internal error pending, which
+/// reaches JavaScript once the method returns.
+#[test]
+fn catch_panic_returns_none_and_leaves_exception_pending() {
+    let harness = crate::Harness::new();
+    harness.run_in_context(|lock, ctx| {
+        let wrapped = jsg::Rc::new(CatchPanicResource).to_js(lock);
+        ctx.set_global(lock, "obj", wrapped);
+        let err = ctx
+            .eval::<bool>(lock, "obj.catchNestedPanic(); true")
+            .unwrap_err()
+            .unwrap_jsg_err(lock);
+        assert!(
+            err.message.contains("internal error"),
+            "unexpected error: {:?}",
+            err.message
+        );
+        assert!(!err.message.contains("intentional nested panic"));
+        Ok(())
+    });
+}
+
 // =============================================================================
 // Receiver guard tests
 // =============================================================================

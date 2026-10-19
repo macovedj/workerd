@@ -123,7 +123,9 @@ scope. There is no public constructor; locks come from:
 - `jsg::modules::add_builtin`, whose callback is a closure that captures nothing, of type
   `for<'s> Fn(&mut Lock<'s>) -> Local<'s, Value>`,
 - `jsg::callback_scope!(unsafe let lock, isolate)` for other Rust code that C++ calls with a
-  scope already open; the caller vouches for the isolate's state, hence `unsafe`,
+  scope already open; the caller vouches for the isolate's state, hence `unsafe`. A panic
+  that reaches C++ aborts, so entry points instead pin a `jsg::CallbackScope` and open it
+  with `jsg::catch_panic`, which turns a panic into a JS internal error,
 - `jsg_test::Harness::run_in_context`.
 
 All scopes open on a thread at the same time must belong to one isolate: opening a scope of

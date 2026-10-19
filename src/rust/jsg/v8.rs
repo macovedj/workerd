@@ -63,7 +63,7 @@ pub mod ffi {
     /// Mirrors `v8::MaybeLocal<T>`: a single pointer-sized word where `ptr == 0` means empty.
     /// This matches V8's internal layout exactly — `v8::MaybeLocal<T>` holds one `Local<T>`
     /// field which is itself one `internal::Address*` (one pointer word).
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone, Copy, Default)]
     struct MaybeLocal {
         ptr: usize,
     }
@@ -710,7 +710,7 @@ pub mod ffi {
         pub unsafe fn register_add_builtin_module(
             registry: Pin<&mut ModuleRegistry>,
             specifier: &str,
-            callback: unsafe fn(*mut Isolate) -> Local,
+            callback: unsafe fn(*mut Isolate) -> MaybeLocal,
             module_type: ModuleType,
         );
     }
@@ -2511,6 +2511,15 @@ impl<'s, T> MaybeLocal<'s, T> {
         }
     }
 
+    /// Returns the underlying FFI handle.
+    ///
+    /// # Safety
+    /// The returned FFI handle carries no lifetime; it must not be used after the
+    /// `HandleScope` that owns the V8 value is closed.
+    pub unsafe fn into_ffi(self) -> ffi::MaybeLocal {
+        self.handle
+    }
+
     /// Returns `true` if this `MaybeLocal` is empty.
     pub fn is_empty(&self) -> bool {
         // SAFETY: handle is a valid ffi::MaybeLocal; no isolate or HandleScope needed.
@@ -2574,7 +2583,8 @@ impl<'s, T> From<Option<Local<'s, T>>> for MaybeLocal<'s, T> {
 /// The callback receives the [`Lock`] of the caller's `HandleScope` and returns a local handle
 /// in it. On success, the handle is transferred back across the CXX bridge as a
 /// [`ffi::MaybeLocal`]. On failure, the error is scheduled as a JavaScript exception and an
-/// empty `MaybeLocal` is returned.
+/// empty `MaybeLocal` is returned. A panic is handled by [`catch_panic`](crate::catch_panic)
+/// and also returns an empty `MaybeLocal`.
 ///
 /// This centralizes the raw-isolate and local-handle ownership transitions for
 /// C++ entry points implemented in Rust. The callback itself contains no FFI
@@ -2591,8 +2601,8 @@ where
     F: for<'s> FnOnce(&mut Lock<'s>) -> Result<Local<'s, T>, E>,
 {
     // SAFETY: forwarded from this function's safety contract.
-    crate::callback_scope!(unsafe let lock, isolate);
-    match callback(lock) {
+    let scope = std::pin::pin!(unsafe { crate::CallbackScope::new(isolate) });
+    crate::catch_panic(scope, |lock| match callback(lock) {
         Ok(local) => {
             // SAFETY: the handle lives in the caller's `HandleScope`, which stays open until
             // the caller consumes it, per this function's safety contract.
@@ -2601,9 +2611,10 @@ where
         }
         Err(error) => {
             lock.throw_exception(&error.into());
-            ffi::MaybeLocal { ptr: 0 }
+            ffi::MaybeLocal::default()
         }
-    }
+    })
+    .unwrap_or_default()
 }
 
 impl<'s> Local<'s, String> {
