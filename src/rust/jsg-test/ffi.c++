@@ -38,12 +38,16 @@ namespace rust::jsg_test {
 
 // Lazy initialization of V8System to avoid static initialization order issues
 static ::workerd::jsg::V8System& getV8System() {
-  static ::workerd::jsg::V8System v8System;
+  // Lets tests optimize functions on demand to reach fast callbacks.
+  static ::workerd::jsg::V8System v8System({"--allow-natives-syntax"});
   return v8System;
 }
 
-TestHarness::TestHarness(::workerd::jsg::V8StackScope&)
-    : isolate(kj::heap<TestIsolate>(getV8System(), kj::heap<::workerd::jsg::IsolateObserver>())),
+TestHarness::TestHarness(::workerd::jsg::V8StackScope&, bool fastApiEnabled)
+    : isolate(kj::heap<TestIsolate>(getV8System(),
+          ::workerd::jsg::newIsolateGroup(),
+          ::workerd::jsg::JsgConfig{.fastApiEnabled = fastApiEnabled},
+          kj::heap<::workerd::jsg::IsolateObserver>())),
       locker(isolate->getIsolate()),
       isolateScope(isolate->getIsolate()),
       realm([&] {
@@ -57,9 +61,10 @@ TestHarness::TestHarness(::workerd::jsg::V8StackScope&)
   isolate->getIsolate()->SetData(::workerd::jsg::SetDataIndex::SET_DATA_RUST_REALM, &*realm);
 }
 
-kj::Own<TestHarness> create_test_harness() {
-  return ::workerd::jsg::runInV8Stack(
-      [](::workerd::jsg::V8StackScope& stackScope) { return kj::heap<TestHarness>(stackScope); });
+kj::Own<TestHarness> create_test_harness(bool fast_api_enabled) {
+  return ::workerd::jsg::runInV8Stack([&](::workerd::jsg::V8StackScope& stackScope) {
+    return kj::heap<TestHarness>(stackScope, fast_api_enabled);
+  });
 }
 
 EvalContext::EvalContext(v8::Isolate* isolate, v8::Local<v8::Context> context)

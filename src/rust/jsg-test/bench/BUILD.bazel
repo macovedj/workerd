@@ -1,0 +1,15 @@
+load("//:build/wd_rust_test.bzl", "wd_rust_test")
+
+# Use `bazel run -c opt //src/rust/jsg-test/bench:bench-dispatch` to benchmark.
+wd_rust_test(
+    name = "bench-dispatch",
+    size = "large",
+    srcs = ["bench-dispatch.rs"],
+    proc_macro_deps = ["//src/rust/jsg-macros"],
+    tags = ["workerd-benchmark"],
+    use_libtest_harness = False,
+    deps = [
+        "//src/rust/jsg",
+        "//src/rust/jsg-test",
+    ],
+)

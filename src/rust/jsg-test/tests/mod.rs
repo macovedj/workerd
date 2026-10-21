@@ -7,6 +7,7 @@ mod buffer_types;
 mod coercion_safety;
 mod collections_gc;
 mod eval;
+mod fast_api;
 mod function;
 mod gc;
 mod jsg_oneof;

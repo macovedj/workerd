@@ -39,7 +39,7 @@ class EvalContext {
 class TestHarness {
  public:
   // Use create_test_harness() instead - it ensures proper V8 stack scope
-  TestHarness(::workerd::jsg::V8StackScope& stackScope);
+  TestHarness(::workerd::jsg::V8StackScope& stackScope, bool fastApiEnabled);
 
   // Runs a callback within a proper V8 context and stack scope
   // The callback receives the data pointer, isolate and a context
@@ -52,7 +52,7 @@ class TestHarness {
   mutable ::rust::Box<::workerd::rust::jsg::Realm> realm;
 };
 
-kj::Own<TestHarness> create_test_harness();
+kj::Own<TestHarness> create_test_harness(bool fast_api_enabled);
 
 // Forward-declared; defined by the CXX-generated lib.rs.h header.
 enum class GcType : uint8_t;

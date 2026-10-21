@@ -15,6 +15,8 @@
 #include <kj-rs/convert.h>
 
 #include <kj/common.h>
+#include <kj/map.h>
+#include <kj/mutex.h>
 #include <kj/string.h>
 
 #include <memory>
@@ -693,10 +695,11 @@ double unwrap_number(Isolate* isolate, Local value) {
   return number->Value();
 }
 
-kj::Maybe<kj::Rc<Wrappable>> unwrap_resource(Isolate* isolate, Local value) {
-  auto v8_val = local_from_ffi<v8::Value>(kj::mv(value));
+namespace {
+// Creates no handles, so fast callbacks can use it without a HandleScope.
+Wrappable* tryUnwrapRustWrappable(Isolate* isolate, v8::Local<v8::Value> v8_val) {
   // Non-object values (numbers, strings, booleans, etc.) are never wrapped resources.
-  if (!v8_val->IsObject()) return kj::none;
+  if (!v8_val->IsObject()) return nullptr;
   auto v8_obj = v8_val.As<v8::Object>();
   // Plain JS objects have no internal fields; check before reading to avoid V8 fatal error.
   if (v8_obj->InternalFieldCount() < ::workerd::jsg::Wrappable::INTERNAL_FIELD_COUNT ||
@@ -705,7 +708,7 @@ kj::Maybe<kj::Rc<Wrappable>> unwrap_resource(Isolate* isolate, Local value) {
           static_cast<v8::EmbedderDataTypeTag>(
               ::workerd::jsg::Wrappable::WRAPPABLE_TAG_FIELD_INDEX)) !=
           const_cast<uint16_t*>(&::workerd::jsg::Wrappable::WORKERD_RUST_WRAPPABLE_TAG)) {
-    return kj::none;
+    return nullptr;
   }
   // The WORKERD_RUST_WRAPPABLE_TAG marker check above established that this is one of our Rust
   // wrappables, so the pointer can be taken directly through the shim.
@@ -715,7 +718,13 @@ kj::Maybe<kj::Rc<Wrappable>> unwrap_resource(Isolate* isolate, Local value) {
     KJ_LOG(FATAL, "wrapper type mismatch: marked object's CppHeap handle resolves to no wrappable");
     abort();
   }
-  auto* ptr = static_cast<Wrappable*>(reinterpret_cast<::workerd::jsg::Wrappable*>(wrappable));
+  return static_cast<Wrappable*>(reinterpret_cast<::workerd::jsg::Wrappable*>(wrappable));
+}
+}  // namespace
+
+kj::Maybe<kj::Rc<Wrappable>> unwrap_resource(Isolate* isolate, Local value) {
+  auto* ptr = tryUnwrapRustWrappable(isolate, local_from_ffi<v8::Value>(kj::mv(value)));
+  if (ptr == nullptr) return kj::none;
   return ptr->toRc();
 }
 
@@ -951,6 +960,88 @@ Local psci_get_this(PropertySetterCallbackInfo* info) {
   return to_ffi(info->Holder());
 }
 
+// FastApiCallbackOptions
+TraitObjectPtr fast_api_unwrap_receiver(FastApiCallbackOptions* options, Local receiver) {
+  auto* wrappable =
+      tryUnwrapRustWrappable(options->isolate, local_from_ffi<v8::Value>(kj::mv(receiver)));
+  if (wrappable == nullptr) return {};
+  return wrappable->trait_object;
+}
+
+void fast_api_throw_illegal_invocation(FastApiCallbackOptions* options) {
+  auto isolate = options->isolate;
+  v8::HandleScope scope(isolate);
+  isolate->ThrowException(
+      v8::Exception::TypeError(::workerd::jsg::v8StrIntern(isolate, "Illegal invocation")));
+}
+
+void fast_api_throw_internal_error(FastApiCallbackOptions* options, ::rust::Str internalMessage) {
+  v8::HandleScope scope(options->isolate);
+  isolate_throw_internal_error(options->isolate, internalMessage);
+  isolate_terminate_execution(options->isolate);
+}
+
+namespace {
+v8::CTypeInfo::Type cTypeOf(FastApiType type) {
+  switch (type) {
+    case FastApiType::Void:
+      return v8::CTypeInfo::Type::kVoid;
+    case FastApiType::Bool:
+      return v8::CTypeInfo::Type::kBool;
+    case FastApiType::Int32:
+      return v8::CTypeInfo::Type::kInt32;
+    case FastApiType::Uint32:
+      return v8::CTypeInfo::Type::kUint32;
+    case FastApiType::Float64:
+      return v8::CTypeInfo::Type::kFloat64;
+  }
+  KJ_UNREACHABLE;
+}
+
+v8::CTypeInfo fastApiArgType(FastApiType type) {
+  KJ_REQUIRE(type != FastApiType::Void);
+  // Values the slow callback would convert differently fall back to it.
+  if (type == FastApiType::Int32 || type == FastApiType::Uint32) {
+    return v8::CTypeInfo(cTypeOf(type), v8::CTypeInfo::Flags::kEnforceRangeBit);
+  }
+  return v8::CTypeInfo(cTypeOf(type));
+}
+
+// V8 keeps a pointer to the CFunction, so it lives for the rest of the process.
+struct FastCFunction {
+  FastCFunction(const FastApiDescriptor& descriptor)
+      : returnType(cTypeOf(descriptor.return_type)),
+        argTypes(buildArgTypes(descriptor)),
+        info(returnType, argTypes.size(), argTypes.begin()),
+        function(reinterpret_cast<const void*>(descriptor.callback), &info) {}
+
+  static kj::Array<v8::CTypeInfo> buildArgTypes(const FastApiDescriptor& descriptor) {
+    auto builder = kj::heapArrayBuilder<v8::CTypeInfo>(descriptor.arg_types.size() + 2);
+    builder.add(v8::CTypeInfo(v8::CTypeInfo::Type::kV8Value));
+    for (auto type: descriptor.arg_types) {
+      builder.add(fastApiArgType(type));
+    }
+    builder.add(v8::CTypeInfo(v8::CTypeInfo::kCallbackOptionsType));
+    return builder.finish();
+  }
+
+  v8::CTypeInfo returnType;
+  kj::Array<v8::CTypeInfo> argTypes;
+  v8::CFunctionInfo info;
+  v8::CFunction function;
+};
+
+const v8::CFunction& getFastCFunction(const FastApiDescriptor& descriptor) {
+  using Map = kj::HashMap<size_t, kj::Own<FastCFunction>>;
+  static kj::MutexGuarded<Map> functions;
+  auto lock = functions.lockExclusive();
+  return lock
+      ->findOrCreate(descriptor.callback, [&]() -> Map::Entry {
+    return {descriptor.callback, kj::heap<FastCFunction>(descriptor)};
+  })->function;
+}
+}  // namespace
+
 Global create_resource_template(Isolate* isolate, const ResourceDescriptor& descriptor) {
   // Construct lazily.
   v8::EscapableHandleScope scope(isolate);
@@ -996,20 +1087,33 @@ Global create_resource_template(Isolate* isolate, const ResourceDescriptor& desc
 
   constructor->SetClassName(classname);
 
-  for (const auto& method: descriptor.static_methods) {
-    auto functionTemplate = v8::FunctionTemplate::New(isolate,
-        reinterpret_cast<v8::FunctionCallback>(reinterpret_cast<void*>(method.callback)),
-        v8::Local<v8::Value>(), v8::Local<v8::Signature>(), 0, v8::ConstructorBehavior::kThrow);
+  const bool fastApiEnabled = ::workerd::jsg::IsolateBase::from(isolate).isFastApiEnabled();
+
+  auto makeMethod = [&](const MethodDescriptor& method, v8::Local<v8::Signature> methodSignature) {
     registerExternalRef(method.callback);
+    auto callback =
+        reinterpret_cast<v8::FunctionCallback>(reinterpret_cast<void*>(method.callback));
+    if (fastApiEnabled) {
+      KJ_IF_SOME(fast, method.fast) {
+        const auto& cFunction = getFastCFunction(fast);
+        registerExternalRef(reinterpret_cast<size_t>(&cFunction));
+        return v8::FunctionTemplate::NewWithCFunctionOverloads(isolate, callback,
+            v8::Local<v8::Value>(), methodSignature, 0, v8::ConstructorBehavior::kThrow,
+            v8::SideEffectType::kHasSideEffect, {&cFunction, 1});
+      }
+    }
+    return v8::FunctionTemplate::New(isolate, callback, v8::Local<v8::Value>(), methodSignature, 0,
+        v8::ConstructorBehavior::kThrow);
+  };
+
+  for (const auto& method: descriptor.static_methods) {
+    auto functionTemplate = makeMethod(method, v8::Local<v8::Signature>());
     functionTemplate->RemovePrototype();
     constructor->Set(makeInternedStr(isolate, method.name), functionTemplate);
   }
 
   for (const auto& method: descriptor.methods) {
-    auto functionTemplate = v8::FunctionTemplate::New(isolate,
-        reinterpret_cast<v8::FunctionCallback>(reinterpret_cast<void*>(method.callback)),
-        v8::Local<v8::Value>(), signature, 0, v8::ConstructorBehavior::kThrow);
-    registerExternalRef(method.callback);
+    auto functionTemplate = makeMethod(method, signature);
     auto name = makeInternedStr(isolate, method.name);
     prototype->Set(name, functionTemplate);
   }

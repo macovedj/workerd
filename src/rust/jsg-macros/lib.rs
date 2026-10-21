@@ -39,6 +39,7 @@ use syn::parse_macro_input;
 use utils::error;
 use utils::extract_name_attribute;
 use utils::extract_named_fields;
+use utils::fast_api_signature;
 use utils::is_lock_ref;
 use utils::is_result_type;
 
@@ -170,7 +171,11 @@ pub fn jsg_struct(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// conversion of the Rust function name.
 #[proc_macro_attribute]
 pub fn jsg_method(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    callback(item, Callback::Function)
+    let input_fn = parse_macro_input!(item as ItemFn);
+    let fast = fast_callback(&input_fn.sig);
+    let mut output = callback(quote! { #input_fn }.into(), Callback::Function);
+    output.extend(TokenStream::from(fast));
+    output
 }
 
 /// The V8 callback shape a generated callback takes.
@@ -313,8 +318,71 @@ fn callback(item: TokenStream, kind: Callback) -> TokenStream {
                 #result_handling
             });
         }
+
     }
     .into()
+}
+
+/// Generates `{name}_fast_api()`, which returns the V8 Fast API callback of a `#[jsg_method]`
+/// if its signature allows one.
+fn fast_callback(fn_sig: &syn::Signature) -> proc_macro2::TokenStream {
+    let fn_name = &fn_sig.ident;
+    let descriptor_name = syn::Ident::new(&format!("{fn_name}_fast_api"), fn_name.span());
+    let Some(fast) = fast_api_signature(fn_sig) else {
+        return quote! {
+            #[automatically_derived]
+            #[doc(hidden)]
+            fn #descriptor_name() -> Option<jsg::v8::ffi::FastApiDescriptor> {
+                None
+            }
+        };
+    };
+    let has_self = fn_sig
+        .inputs
+        .iter()
+        .any(|arg| matches!(arg, FnArg::Receiver(_)));
+    let fast_name = syn::Ident::new(&format!("{fn_name}_fast_callback"), fn_name.span());
+    let args: Vec<_> = (0..fast.args.len())
+        .map(|i| syn::Ident::new(&format!("arg{i}"), fn_name.span()))
+        .collect();
+    let arg_types = &fast.args;
+    let ret = fast.ret.map_or_else(|| quote! { () }, |ty| quote! { #ty });
+    let call_args = quote! { #(jsg::fast_api::FastApiArg::from_raw(#args)),* };
+    let (receiver, call) = if has_self {
+        (
+            quote! { receiver },
+            quote! {
+                jsg::fast_api::method::<Self, _>(options, receiver, |this| this.#fn_name(#call_args))
+            },
+        )
+    } else {
+        (
+            quote! { _receiver },
+            quote! { jsg::fast_api::static_method(options, || Self::#fn_name(#call_args)) },
+        )
+    };
+    quote! {
+        #[automatically_derived]
+        #[doc(hidden)]
+        #[expect(clippy::undocumented_unsafe_blocks)]
+        unsafe extern "C" fn #fast_name(
+            #receiver: jsg::v8::ffi::Local,
+            #(#args: <#arg_types as jsg::fast_api::FastApiArg>::Raw,)*
+            options: *mut jsg::v8::ffi::FastApiCallbackOptions,
+        ) -> <#ret as jsg::fast_api::FastApiReturn>::Raw {
+            unsafe { #call }
+        }
+
+        #[automatically_derived]
+        #[doc(hidden)]
+        fn #descriptor_name() -> Option<jsg::v8::ffi::FastApiDescriptor> {
+            Some(jsg::v8::ffi::FastApiDescriptor {
+                callback: Self::#fast_name as usize,
+                return_type: <#ret as jsg::fast_api::FastApiReturn>::TYPE,
+                arg_types: vec![#(<#arg_types as jsg::fast_api::FastApiArg>::TYPE),*],
+            })
+        }
+    }
 }
 
 /// The parameters of a generated callback, and expressions for its isolate and

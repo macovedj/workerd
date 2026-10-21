@@ -49,3 +49,37 @@ fn is_attr_cases() {
     // Qualified path (`jsg_macros::jsg_method`) must also match by last segment.
     assert!(is_attr(&qualified.attrs[0], "jsg_method"));
 }
+
+#[test]
+fn fast_api_signature_cases() {
+    let fast =
+        |sig: syn::Signature| fast_api_signature(&sig).map(|f| (f.args.len(), f.ret.is_some()));
+
+    assert_eq!(
+        fast(parse_quote!(fn f(&self, a: i32, b: u32) -> bool)),
+        Some((2, true))
+    );
+    assert_eq!(
+        fast(parse_quote!(fn f(&self, x: jsg::Number) -> Number)),
+        Some((1, true))
+    );
+    assert_eq!(fast(parse_quote!(fn f(a: bool))), Some((1, false)));
+    assert_eq!(fast(parse_quote!(fn f(&self) -> ())), Some((0, false)));
+
+    assert_eq!(fast(parse_quote!(fn f(&mut self, a: i32))), None);
+    assert_eq!(fast(parse_quote!(fn f(self, a: i32))), None);
+    assert_eq!(fast(parse_quote!(fn f(&self, s: String))), None);
+    assert_eq!(
+        fast(parse_quote!(fn f(&self, lock: &mut Lock, a: i32))),
+        None
+    );
+    assert_eq!(fast(parse_quote!(fn f(&self, x: f64))), None);
+    assert_eq!(fast(parse_quote!(fn f(&self, x: other::Number))), None);
+    assert_eq!(fast(parse_quote!(fn f(&self) -> i32)), None);
+    assert_eq!(
+        fast(parse_quote!(fn f(&self) -> Result<bool, jsg::Error>)),
+        None
+    );
+    assert_eq!(fast(parse_quote!(fn f<T>(&self, a: i32))), None);
+    assert_eq!(fast(parse_quote!(async fn f(&self, a: i32))), None);
+}

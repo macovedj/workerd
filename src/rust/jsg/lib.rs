@@ -6,6 +6,7 @@ use std::future::Future;
 use std::num::ParseIntError;
 use std::ops::Deref;
 
+pub mod fast_api;
 pub mod feature_flags;
 pub mod lenient;
 pub mod macros;
@@ -897,6 +898,7 @@ pub enum Member {
     Method {
         name: String,
         callback: unsafe extern "C" fn(*mut v8::ffi::FunctionCallbackInfo),
+        fast: Option<v8::ffi::FastApiDescriptor>,
     },
     /// A property accessor on the prototype (`Prototype` or `Inspect`; `Instance`
     /// panics). `setter_callback = None` makes the property read-only; `Inspect`
@@ -920,6 +922,7 @@ pub enum Member {
     StaticMethod {
         name: String,
         callback: unsafe extern "C" fn(*mut v8::ffi::FunctionCallbackInfo),
+        fast: Option<v8::ffi::FastApiDescriptor>,
     },
     StaticConstant {
         name: String,
@@ -1028,15 +1031,18 @@ pub fn catch_panic<F: FnOnce()>(lock: &mut Lock, f: F) {
     // single-threaded, so there is no aliasing hazard on unwind.
     // `AssertUnwindSafe` is therefore correct here.
     if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
-        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-            *s
-        } else if let Some(s) = payload.downcast_ref::<String>() {
-            s.as_str()
-        } else {
-            "<non-string panic payload>"
-        };
-        lock.throw_internal_error(msg);
+        lock.throw_internal_error(panic_message(&*payload));
         lock.terminate_execution();
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "<non-string panic payload>"
     }
 }
 

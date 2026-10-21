@@ -38,7 +38,7 @@ mod ffi {
         type TestHarness;
         type EvalContext;
 
-        pub unsafe fn create_test_harness() -> KjOwn<TestHarness>;
+        pub unsafe fn create_test_harness(fast_api_enabled: bool) -> KjOwn<TestHarness>;
         pub unsafe fn run_in_context(
             self: &TestHarness,
             data: usize, /* callback */
@@ -190,7 +190,14 @@ impl EvalContext<'_> {
 impl Harness {
     pub fn new() -> Self {
         // SAFETY: create_test_harness initializes the V8 platform and returns a valid harness.
-        Self(unsafe { ffi::create_test_harness() })
+        Self(unsafe { ffi::create_test_harness(false) })
+    }
+
+    /// Like [`Harness::new`], with `JsgConfig::fastApiEnabled` set so that resource methods get
+    /// V8 Fast API callbacks.
+    pub fn with_fast_api() -> Self {
+        // SAFETY: as in `new`.
+        Self(unsafe { ffi::create_test_harness(true) })
     }
 
     /// Runs a callback within a V8 context.

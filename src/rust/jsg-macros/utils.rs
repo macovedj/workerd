@@ -145,6 +145,61 @@ pub fn is_lock_ref(ty: &syn::Type) -> bool {
     }
 }
 
+/// The JavaScript argument and return types of a method V8 can call through a fast callback.
+pub struct FastApiSignature<'a> {
+    pub args: Vec<&'a syn::Type>,
+    pub ret: Option<&'a syn::Type>,
+}
+
+/// Returns the fast signature of `sig`, or `None` if V8 cannot call it directly.
+pub fn fast_api_signature(sig: &syn::Signature) -> Option<FastApiSignature<'_>> {
+    if sig.asyncness.is_some() || !sig.generics.params.is_empty() || sig.variadic.is_some() {
+        return None;
+    }
+    let mut args = Vec::new();
+    for input in &sig.inputs {
+        match input {
+            syn::FnArg::Receiver(receiver) => {
+                if receiver.reference.is_none() || receiver.mutability.is_some() {
+                    return None;
+                }
+            }
+            syn::FnArg::Typed(pat_type) => {
+                if !is_named_type(&pat_type.ty, &["bool", "i32", "u32", "Number"]) {
+                    return None;
+                }
+                args.push(pat_type.ty.as_ref());
+            }
+        }
+    }
+    let ret = match &sig.output {
+        syn::ReturnType::Default => None,
+        syn::ReturnType::Type(_, ty) => match ty.as_ref() {
+            syn::Type::Tuple(tuple) if tuple.elems.is_empty() => None,
+            ty if is_named_type(ty, &["bool", "Number"]) => Some(ty),
+            _ => return None,
+        },
+    };
+    Some(FastApiSignature { args, ret })
+}
+
+/// Whether `ty` is one of `names`, written bare or, for `Number`, as `jsg::Number`.
+fn is_named_type(ty: &syn::Type, names: &[&str]) -> bool {
+    let syn::Type::Path(type_path) = ty else {
+        return false;
+    };
+    if type_path.qself.is_some() || type_path.path.leading_colon.is_some() {
+        return false;
+    }
+    let segments: Vec<_> = type_path.path.segments.iter().collect();
+    let last = match segments.as_slice() {
+        [last] => last,
+        [module, last] if module.ident == "jsg" && last.ident == "Number" => last,
+        _ => return false,
+    };
+    last.arguments.is_none() && names.iter().any(|name| last.ident == name)
+}
+
 #[cfg(test)]
 #[path = "utils-test.rs"]
 mod tests;

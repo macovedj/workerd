@@ -292,6 +292,19 @@ impl WebSocket {
 
 Constants are set on both the constructor and prototype as read-only, non-configurable properties per Web IDL. The name is used as-is (no camelCase conversion). Only numeric types are supported (`i8`..`i64`, `u8`..`u64`, `f32`, `f64`).
 
+## Fast API
+
+`#[jsg_method]` gives a method a V8 Fast API callback, as C++ JSG does, when its signature
+allows one:
+
+- the receiver is `&self` or absent,
+- every argument is `bool`, `i32`, `u32` or `jsg::Number`,
+- the return type is `bool`, `jsg::Number` or `()`.
+
+Fast callbacks are only installed when the isolate's `JsgConfig` has `fastApiEnabled` set. V8
+falls back to the slow callback for any argument the slow path would convert differently. A fast
+method must not call into V8.
+
 ## FFI Functions with Raw Pointers
 
 Functions exposed to C++ via FFI that receive raw pointers must be marked `unsafe fn`:
