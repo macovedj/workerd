@@ -25,6 +25,7 @@ pub use resource::Resource;
 pub use resource::Weak;
 pub use scope::CallbackScope;
 pub use scope::CallbackScopeParam;
+pub use scope::Isolate;
 pub use scope::Lock;
 pub use scope::RawFunctionCallback;
 pub use scope::RawGetterCallback;

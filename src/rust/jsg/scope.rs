@@ -2,7 +2,8 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
-//! Locks for the handle scopes that C++ and V8 open before calling into Rust.
+//! Locks for the handle scopes that C++ and V8 open before calling into Rust, and
+//! [`Isolate`] for code that only needs the isolate lock.
 //!
 //! Every V8 handle lives in a `v8::HandleScope` and dies when that scope closes. A
 //! [`Lock<'s>`](Lock) stands for the innermost open scope. It is only ever handed out as
@@ -63,7 +64,9 @@ impl Lock<'_> {
         }
     }
 
-    /// Returns the isolate associated with this lock.
+    /// Returns the raw pointer of the isolate associated with this lock. The pointer proves
+    /// nothing about the lock; code that needs a locked isolate borrows the lock's [`Isolate`]
+    /// through `Deref` instead.
     pub fn isolate(&self) -> v8::IsolatePtr {
         self.isolate
     }
@@ -71,6 +74,63 @@ impl Lock<'_> {
     /// Returns the identity of this lock's isolate.
     pub(crate) fn isolate_id(&mut self) -> IsolateId {
         self.realm().id()
+    }
+}
+
+/// A V8 isolate that the current thread has locked.
+///
+/// It is only ever used by reference: `&'a mut Isolate` proves that the isolate is locked for
+/// `'a`. Like any `&mut`, it is exclusive: while it is used, no other `Lock` or `Isolate`
+/// reference for the isolate is, so methods taking `&mut self` may rely on that. Unlike a
+/// [`Lock`], it requires no entered context and no open `HandleScope`, so it suits APIs that
+/// only need the isolate lock. A `Lock` dereferences to its isolate; C++ that only locks the
+/// isolate passes it to [`Isolate::from_raw`].
+///
+/// `Isolate` is neither `Send` nor `Sync`.
+#[repr(C)]
+pub struct Isolate {
+    _opaque: [u8; 0],
+    _not_send: PhantomData<*mut ()>,
+}
+
+impl Isolate {
+    /// Borrows the isolate behind `isolate`.
+    ///
+    /// # Safety
+    /// `isolate` must point to a valid `v8::Isolate` that this thread keeps locked for `'a`.
+    /// No `Lock` or other `Isolate` reference for it may be used during `'a`.
+    #[expect(unsafe_code, reason = "turns a raw isolate pointer into a reference")]
+    pub unsafe fn from_raw<'a>(isolate: *mut v8::ffi::Isolate) -> &'a mut Self {
+        // SAFETY: `isolate` points to a valid `v8::Isolate` (guaranteed by caller).
+        debug_assert!(unsafe { v8::ffi::isolate_is_locked(isolate) });
+        // SAFETY: the isolate is locked for `'a` and not otherwise referenced during `'a`
+        // (guaranteed by caller). `Isolate` is zero-sized, so the reference covers no memory.
+        unsafe { &mut *isolate.cast::<Self>() }
+    }
+
+    /// Returns the raw pointer to the `v8::Isolate`.
+    pub fn as_ffi(&self) -> *mut v8::ffi::Isolate {
+        std::ptr::from_ref(self).cast_mut().cast()
+    }
+}
+
+impl std::ops::Deref for Lock<'_> {
+    type Target = Isolate;
+
+    #[expect(unsafe_code, reason = "borrows the lock's isolate")]
+    fn deref(&self) -> &Isolate {
+        // SAFETY: the lock proves the isolate is locked while it is borrowed, and `Isolate` is
+        // zero-sized, so the reference covers no memory.
+        unsafe { &*self.isolate.as_ffi().cast::<Isolate>() }
+    }
+}
+
+impl std::ops::DerefMut for Lock<'_> {
+    #[expect(unsafe_code, reason = "borrows the lock's isolate")]
+    fn deref_mut(&mut self) -> &mut Isolate {
+        // SAFETY: as in `deref`; the isolate is borrowed through the exclusive borrow of the
+        // lock.
+        unsafe { &mut *self.isolate.as_ffi().cast::<Isolate>() }
     }
 }
 

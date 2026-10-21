@@ -128,6 +128,10 @@ scope. There is no public constructor; locks come from:
   with `jsg::catch_panic`, which turns a panic into a JS internal error,
 - `jsg_test::Harness::run_in_context`.
 
+Code that only needs the isolate to be locked, with no context or scope, takes
+`&mut jsg::Isolate`. A `Lock` dereferences to its isolate, and C++ that only locks the
+isolate passes it through `unsafe` `jsg::Isolate::from_raw`.
+
 All scopes open on a thread at the same time must belong to one isolate: opening a scope of
 another isolate while one is open panics, so a handle is never used with another isolate's
 lock. `jsg::allow_scopes_of_another_isolate` (`unsafe`) lifts the rule for code that must open

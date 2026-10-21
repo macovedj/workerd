@@ -21,6 +21,23 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
 }
 
 #[test]
+fn lock_derefs_to_its_isolate() {
+    let harness = crate::Harness::new();
+    harness.run_in_context(|lock, _ctx| {
+        let ptr = lock.isolate().as_ffi();
+        let shared: &jsg::Isolate = lock;
+        assert_eq!(shared.as_ffi(), ptr);
+        let isolate: &mut jsg::Isolate = lock;
+        assert_eq!(isolate.as_ffi(), ptr);
+        // SAFETY: the lock's isolate is locked by this thread, and neither `lock` nor `isolate`
+        // is used while `raw` lives.
+        let raw = unsafe { jsg::Isolate::from_raw(ptr) };
+        assert_eq!(raw.as_ffi(), ptr);
+        Ok(())
+    });
+}
+
+#[test]
 fn scope_of_another_isolate_panics() {
     let a = crate::Harness::new();
     let b = crate::Harness::new();
