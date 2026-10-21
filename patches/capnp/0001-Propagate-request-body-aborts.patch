@@ -1,0 +1,442 @@
+Propagate explicit body aborts through KJ pipes and HTTP adapters.
+
+An errored upload must not become a clean pipe EOF or cause the chunked
+HTTP writer to emit a successful terminating chunk during destruction.
+Preserve the original exception for pending and future pipe operations.
+
+diff --git a/src/kj/async-io.c++ b/src/kj/async-io.c++
+--- a/src/kj/async-io.c++
++++ b/src/kj/async-io.c++
+@@ -266,6 +266,8 @@
+ namespace {
+ 
+ class AsyncPipe final: public AsyncCapabilityStream, public Refcounted {
++  enum class AbortSource { READ, WRITE };
++
+ public:
+   ~AsyncPipe() noexcept(false) {
+     KJ_REQUIRE(state == kj::none || ownState.get() != nullptr,
+@@ -339,11 +341,21 @@
+     KJ_IF_SOME(s, state) {
+       s.abortRead();
+     } else {
+-      ownState = kj::heap<AbortedRead>();
++      ownState = kj::heap<AbortedRead>(writeAbortReason.get() == nullptr
++          ? KJ_EXCEPTION(DISCONNECTED, "abortRead() has been called")
++          : writeAbortReason->clone(),
++          writeAbortReason.get() == nullptr ? AbortSource::READ : AbortSource::WRITE);
+       state = *ownState;
+ 
+       readAbortEvent.signal();
+     }
++  }
++
++  void abortWrite(kj::Exception&& exception) override {
++    if (writeAbortReason.get() == nullptr) {
++      writeAbortReason = kj::heap<kj::Exception>(kj::mv(exception));
++    }
++    abortRead();
+   }
+ 
+   Promise<void> write(ArrayPtr<const byte> buffer) override {
+@@ -468,6 +480,21 @@
+   kj::Own<AsyncCapabilityStream> ownState;
+ 
+   StickyFlag readAbortEvent;
++  kj::Own<kj::Exception> writeAbortReason;
++  // Allocated only on an explicit write abort. Normal pipes keep their existing allocation profile.
++
++  kj::Exception readAbortReason() const {
++    if (writeAbortReason.get() != nullptr) return writeAbortReason->clone();
++    return KJ_EXCEPTION(DISCONNECTED, "read end of pipe was aborted");
++  }
++
++  void cancelOnReadAbort(kj::Canceler& canceler) {
++    if (writeAbortReason.get() != nullptr) {
++      canceler.cancel(*writeAbortReason);
++    } else {
++      canceler.cancel("abortRead() was called");
++    }
++  }
+ 
+   void endState(AsyncIoStream& obj) {
+     KJ_IF_SOME(s, state) {
+@@ -759,8 +786,8 @@
+     }
+ 
+     void abortRead() override {
+-      canceler.cancel("abortRead() was called");
+-      fulfiller.reject(KJ_EXCEPTION(DISCONNECTED, "read end of pipe was aborted"));
++      pipe.cancelOnReadAbort(canceler);
++      fulfiller.reject(pipe.readAbortReason());
+       pipe.endState(*this);
+       pipe.abortRead();
+     }
+@@ -958,7 +985,9 @@
+     }
+ 
+     void abortRead() override {
+-      if (!isReadOutstanding) {
++      if (!isReadOutstanding && pipe.writeAbortReason.get() == nullptr) {
++        // A read-side abort can still allow a pump whose input has reached EOF to succeed.
++        // An explicit write abort must always reject the pump with its supplied exception.
+         // No read in flight, we must check for EOF.
+ 
+         // The input might have reached EOF, but we haven't detected it yet because we haven't tried
+@@ -973,7 +1002,7 @@
+             if (n == 0) {
+               fulfiller.fulfill(kj::cp(pumpedSoFar));
+             } else {
+-              fulfiller.reject(KJ_EXCEPTION(DISCONNECTED, "read end of pipe was aborted"));
++              fulfiller.reject(pipe.readAbortReason());
+             }
+           }).eagerlyEvaluate([this](kj::Exception&& e) {
+             fulfiller.reject(kj::mv(e));
+@@ -981,8 +1010,8 @@
+         });
+       } else {
+         // Read is in-flight; by definition we are not at EOF.
+-        canceler.cancel("abortRead() was called");
+-        fulfiller.reject(KJ_EXCEPTION(DISCONNECTED, "read end of pipe was aborted"));
++        pipe.cancelOnReadAbort(canceler);
++        fulfiller.reject(pipe.readAbortReason());
+       }
+ 
+       pipe.endState(*this);
+@@ -1077,8 +1106,8 @@
+     }
+ 
+     void abortRead() override {
+-      canceler.cancel("abortRead() was called");
+-      fulfiller.reject(KJ_EXCEPTION(DISCONNECTED, "read end of pipe was aborted"));
++      pipe.cancelOnReadAbort(canceler);
++      fulfiller.reject(pipe.readAbortReason());
+       pipe.endState(*this);
+       pipe.abortRead();
+     }
+@@ -1426,8 +1455,8 @@
+     }
+ 
+     void abortRead() override {
+-      canceler.cancel("abortRead() was called");
+-      fulfiller.reject(KJ_EXCEPTION(DISCONNECTED, "read end of pipe was aborted"));
++      pipe.cancelOnReadAbort(canceler);
++      fulfiller.reject(pipe.readAbortReason());
+       pipe.endState(*this);
+       pipe.abortRead();
+     }
+@@ -1671,51 +1700,54 @@
+     // AsyncPipe state when abortRead() has been called.
+ 
+   public:
++    AbortedRead(kj::Exception reason, AbortSource source): reason(kj::mv(reason)), source(source) {}
++
+     Promise<size_t> tryRead(void* readBufferPtr, size_t minBytes, size_t maxBytes) override {
+-      return KJ_EXCEPTION(DISCONNECTED, "abortRead() has been called");
++      return reason.clone();
+     }
+     Maybe<size_t> tryReadSync(ArrayPtr<byte> buffer, size_t minBytes) override {
+-      kj::throwFatalException(KJ_EXCEPTION(DISCONNECTED, "abortRead() has been called"));
++      kj::throwFatalException(reason.clone());
+     }
+     Promise<ReadResult> tryReadWithFds(void* readBuffer, size_t minBytes, size_t maxBytes,
+                                        OwnFd* fdBuffer, size_t maxFds) override {
+-      return KJ_EXCEPTION(DISCONNECTED, "abortRead() has been called");
++      return reason.clone();
+     }
+     Promise<ReadResult> tryReadWithStreams(
+         void* readBuffer, size_t minBytes, size_t maxBytes,
+         Own<AsyncCapabilityStream>* streamBuffer, size_t maxStreams) override {
+-      return KJ_EXCEPTION(DISCONNECTED, "abortRead() has been called");
++      return reason.clone();
+     }
+     Promise<uint64_t> pumpTo(AsyncOutputStream& output, uint64_t amount) override {
+-      return KJ_EXCEPTION(DISCONNECTED, "abortRead() has been called");
++      return reason.clone();
+     }
+     void abortRead() override {
+       // ignore repeated abort
+     }
+ 
+     Promise<void> write(ArrayPtr<const byte> buffer) override {
+-      return KJ_EXCEPTION(DISCONNECTED, "abortRead() has been called");
++      return reason.clone();
+     }
+     Promise<void> write(ArrayPtr<const ArrayPtr<const byte>> pieces) override {
+-      return KJ_EXCEPTION(DISCONNECTED, "abortRead() has been called");
++      return reason.clone();
+     }
+     bool tryWriteSync(ArrayPtr<const byte> buffer) override {
+-      kj::throwFatalException(KJ_EXCEPTION(DISCONNECTED, "abortRead() has been called"));
++      kj::throwFatalException(reason.clone());
+     }
+     bool tryWriteSync(ArrayPtr<const ArrayPtr<const byte>> pieces) override {
+-      kj::throwFatalException(KJ_EXCEPTION(DISCONNECTED, "abortRead() has been called"));
++      kj::throwFatalException(reason.clone());
+     }
+     Promise<void> writeWithFds(ArrayPtr<const byte> data,
+                               ArrayPtr<const ArrayPtr<const byte>> moreData,
+                               ArrayPtr<const int> fds) override {
+-      return KJ_EXCEPTION(DISCONNECTED, "abortRead() has been called");
++      return reason.clone();
+     }
+     Promise<void> writeWithStreams(ArrayPtr<const byte> data,
+                                   ArrayPtr<const ArrayPtr<const byte>> moreData,
+                                   Array<Own<AsyncCapabilityStream>> streams) override {
+-      return KJ_EXCEPTION(DISCONNECTED, "abortRead() has been called");
++      return reason.clone();
+     }
+     Maybe<Promise<uint64_t>> tryPumpFrom(AsyncInputStream& input, uint64_t amount) override {
++      if (source == AbortSource::WRITE) return kj::Promise<uint64_t>(reason.clone());
+       // There might not actually be any data in `input`, in which case a pump wouldn't actually
+       // write anything and wouldn't fail.
+ 
+@@ -1727,14 +1759,13 @@
+         // buffered pump, which would allocate a big old buffer just to find there's nothing to
+         // read. Let's try reading 1 byte to avoid that allocation.
+         static char c;
+-        return input.tryRead(&c, 1, 1).then([](size_t n) {
++        return input.tryRead(&c, 1, 1).then([reason = reason.clone()](size_t n) {
+           if (n == 0) {
+             // Yay, we're at EOF as hoped.
+             return uint64_t(0);
+           } else {
+             // There was data in the input. The pump would have thrown.
+-            kj::throwRecoverableException(
+-                KJ_EXCEPTION(DISCONNECTED, "abortRead() has been called"));
++            kj::throwRecoverableException(reason.clone());
+             return uint64_t(0);
+           }
+         });
+@@ -1747,6 +1778,10 @@
+     Promise<void> whenWriteDisconnected() override {
+       KJ_FAIL_ASSERT("can't get here -- implemented by AsyncPipe");
+     }
++
++  private:
++    kj::Exception reason;
++    AbortSource source;
+   };
+ 
+   class ShutdownedWrite final: public AsyncCapabilityStream {
+@@ -1869,6 +1904,12 @@
+ 
+   Promise<void> whenWriteDisconnected() override {
+     return pipe->whenWriteDisconnected();
++  }
++
++  void abortWrite(kj::Exception&& exception) override {
++    // Destroying the write end signals clean EOF. An explicit abort instead propagates its reason
++    // to both sides, so consumers do not mistake a truncated body for a complete one.
++    pipe->abortWrite(kj::mv(exception));
+   }
+ 
+ private:
+diff --git a/src/kj/async-io-test.c++ b/src/kj/async-io-test.c++
+--- a/src/kj/async-io-test.c++
++++ b/src/kj/async-io-test.c++
+@@ -1583,6 +1583,110 @@
+   KJ_EXPECT(pipe.in->readAllText().wait(ws) == "");
+ }
+ 
++template <typename T>
++void expectPipeWriteAbort(kj::Promise<T> promise, WaitScope& ws) {
++  KJ_IF_SOME(exception, kj::runCatchingExceptions([&]() { promise.wait(ws); })) {
++    KJ_EXPECT(exception.getType() == kj::Exception::Type::FAILED);
++    KJ_EXPECT(exception.getDescription() == "upload source failed");
++  } else {
++    KJ_FAIL_EXPECT("expected the original upload failure");
++  }
++}
++
++KJ_TEST("Userland pipe abortWrite rejects a pending read") {
++  kj::EventLoop loop;
++  WaitScope ws(loop);
++  auto pipe = newOneWayPipe();
++  char buffer[8];
++  auto read = pipe.in->tryRead(buffer, 1, sizeof(buffer));
++  KJ_EXPECT(!read.poll(ws));
++
++  pipe.out->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
++  pipe.out = nullptr;
++
++  expectPipeWriteAbort(kj::mv(read), ws);
++}
++
++KJ_TEST("Userland pipe abortWrite rejects future reads") {
++  kj::EventLoop loop;
++  WaitScope ws(loop);
++  auto pipe = newOneWayPipe();
++  pipe.out->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
++  pipe.out = nullptr;
++
++  char buffer[8];
++  expectPipeWriteAbort(pipe.in->tryRead(buffer, 1, sizeof(buffer)), ws);
++}
++
++KJ_TEST("Userland pipe abortWrite rejects a pending pump") {
++  kj::EventLoop loop;
++  WaitScope ws(loop);
++  auto pipe = newOneWayPipe();
++  auto destination = newOneWayPipe();
++  auto pump = pipe.in->pumpTo(*destination.out);
++
++  auto write = pipe.out->write("foo"_kjb);
++  expectRead(*destination.in, "foo").wait(ws);
++  write.wait(ws);
++  KJ_EXPECT(!pump.poll(ws));
++
++  pipe.out->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
++  pipe.out = nullptr;
++
++  expectPipeWriteAbort(kj::mv(pump), ws);
++}
++
++KJ_TEST("Userland pipe abortWrite preserves its reason for pending and future writes") {
++  kj::EventLoop loop;
++  WaitScope ws(loop);
++  auto pipe = newOneWayPipe();
++  auto write = pipe.out->write("foo"_kjb);
++  KJ_EXPECT(!write.poll(ws));
++
++  pipe.out->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
++  expectPipeWriteAbort(kj::mv(write), ws);
++  expectPipeWriteAbort(pipe.out->write("bar"_kjb), ws);
++  expectPipeWriteAbort(kj::evalNow([&]() { return pipe.out->tryWriteSync("baz"_kjb); }), ws);
++}
++
++KJ_TEST("Userland pipe abortWrite rejects an adopted pump without waiting for input") {
++  kj::EventLoop loop;
++  WaitScope ws(loop);
++  auto source = newOneWayPipe();
++  auto destination = newOneWayPipe();
++  auto pump = KJ_ASSERT_NONNULL(destination.out->tryPumpFrom(*source.in));
++  KJ_EXPECT(!pump.poll(ws));
++
++  destination.out->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
++  KJ_ASSERT(pump.poll(ws));
++  expectPipeWriteAbort(kj::mv(pump), ws);
++}
++
++KJ_TEST("Userland pipe abortWrite rejects a future adopted pump without waiting for input") {
++  kj::EventLoop loop;
++  WaitScope ws(loop);
++  auto source = newOneWayPipe();
++  auto destination = newOneWayPipe();
++  destination.out->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
++
++  auto pump = KJ_ASSERT_NONNULL(destination.out->tryPumpFrom(*source.in));
++  KJ_ASSERT(pump.poll(ws));
++  expectPipeWriteAbort(kj::mv(pump), ws);
++}
++
++KJ_TEST("Userland pipe read abort allows a future pump whose input reaches EOF") {
++  kj::EventLoop loop;
++  WaitScope ws(loop);
++  auto source = newOneWayPipe();
++  auto destination = newOneWayPipe();
++  destination.in = nullptr;
++
++  auto pump = KJ_ASSERT_NONNULL(destination.out->tryPumpFrom(*source.in));
++  KJ_EXPECT(!pump.poll(ws));
++  source.out = nullptr;
++  KJ_EXPECT(pump.wait(ws) == 0);
++}
++
+ KJ_TEST("Userland pipe cancel read") {
+   kj::EventLoop loop;
+   WaitScope ws(loop);
+diff --git a/src/kj/compat/http.c++ b/src/kj/compat/http.c++
+--- a/src/kj/compat/http.c++
++++ b/src/kj/compat/http.c++
+@@ -2669,6 +2669,17 @@
+     }
+   }
+ 
++  void abortWrite(kj::Exception&& exception) override {
++    if (finished) return;
++    KJ_IF_SOME(inner, weakInner) {
++      inner.unsetCurrentWrapper(weakInner);
++      inner.abortBody();
++    }
++    // In particular, prevent HttpChunkedEntityWriter's destructor from sending a successful
++    // terminating chunk after the body source failed.
++    finished = true;
++  }
++
+ protected:
+   HttpOutputStream& getInner() {
+     KJ_IF_SOME(i, weakInner) {
+@@ -7760,7 +7771,12 @@
+       auto innerReq = client.request(method, url, headers, requestBody.tryGetLength());
+ 
+       auto promises = kj::heapArrayBuilder<kj::Promise<void>>(2);
++      auto& requestOutput = *innerReq.body;
+       promises.add(requestBody.pumpTo(*innerReq.body).ignoreResult()
++          .catch_([&requestOutput](kj::Exception&& exception) -> kj::Promise<void> {
++        requestOutput.abortWrite(exception.clone());
++        return kj::mv(exception);
++      })
+           .attach(kj::mv(innerReq.body)).eagerlyEvaluate(nullptr));
+ 
+       promises.add(innerReq.response
+diff --git a/src/kj/compat/http-test.c++ b/src/kj/compat/http-test.c++
+--- a/src/kj/compat/http-test.c++
++++ b/src/kj/compat/http-test.c++
+@@ -1278,6 +1278,56 @@
+   auto text = serverPromise.wait(waitScope);
+   KJ_EXPECT(text == "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     "b\r\nfoo bar baz\r\n0\r\n\r\n", text);
++}
++
++KJ_TEST("HttpClient aborted chunked body does not send a terminating chunk") {
++  KJ_HTTP_TEST_SETUP_IO;
++  auto pipe = KJ_HTTP_TEST_CREATE_2PIPE;
++  auto serverPromise = pipe.ends[1]->readAllText();
++
++  {
++    HttpHeaderTable table;
++    auto client = newHttpClient(table, *pipe.ends[0]);
++    auto req = client->request(HttpMethod::POST, "/", HttpHeaders(table));
++    req.body->write("partial"_kjb).wait(waitScope);
++    req.body->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
++    req.body = nullptr;
++
++    KJ_EXPECT_THROW_MESSAGE("can't start new request until previous request body",
++        client->request(HttpMethod::GET, "/", HttpHeaders(table)));
++  }
++
++  pipe.ends[0]->shutdownWrite();
++  auto text = serverPromise.wait(waitScope);
++  KJ_EXPECT(text == "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
++                    "7\r\npartial\r\n", text);
++}
++
++KJ_TEST("HttpService adapter aborts a chunked body when its source fails") {
++  KJ_HTTP_TEST_SETUP_IO;
++  auto pipe = KJ_HTTP_TEST_CREATE_2PIPE;
++  auto serverPromise = pipe.ends[1]->readAllText();
++
++  {
++    HttpHeaderTable table;
++    auto nativeClient = newHttpClient(table, *pipe.ends[0]);
++    auto service = newHttpService(*nativeClient);
++    auto client = newHttpClient(*service);
++    auto req = client->request(HttpMethod::POST, "/", HttpHeaders(table));
++    req.body->write("partial"_kjb).wait(waitScope);
++    req.body->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
++    req.body = nullptr;
++
++    KJ_EXPECT_THROW_MESSAGE("upload source failed", req.response.wait(waitScope));
++    KJ_EXPECT_THROW_MESSAGE("can't start new request until previous request body",
++        nativeClient->request(HttpMethod::GET, "/", HttpHeaders(table)));
++    KJ_EXPECT(!serverPromise.poll(waitScope));
++  }
++
++  pipe.ends[0]->shutdownWrite();
++  auto text = serverPromise.wait(waitScope);
++  KJ_EXPECT(text == "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
++                    "7\r\npartial\r\n", text);
+ }
+ 
+ KJ_TEST("HttpClient fixed-length body tryWriteSync") {
