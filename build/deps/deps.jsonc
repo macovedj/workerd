@@ -31,9 +31,11 @@
     {
       "name": "capnp-cpp",
       "type": "github_tarball",
-      "owner": "capnproto",
+      // Review pin for the coordinated upload-abort changes in macovedj/capnproto.
+      "owner": "macovedj",
       "repo": "capnproto",
-      "branch": "v2",
+      "branch": "learn-pipe-abort",
+      "freeze_commit": "d9415ee475483ff5a5d9805e868fde68e576262b",
       "extra_strip_prefix": "/c++"
     },
     // We want to avoid version skew with v8, so we use identical versions. Keep this
